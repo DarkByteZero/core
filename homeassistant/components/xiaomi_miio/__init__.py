@@ -198,6 +198,8 @@ class VacuumCoordinatorData:
     timers: list[Timer]
     fan_speeds: dict[str, int]
     fan_speeds_reverse: dict[int, str]
+    mopping_intensities: dict[str, int]
+    mopping_intensities_reverse: dict[int, str]
 
 
 @dataclass(init=False, frozen=True)
@@ -220,6 +222,8 @@ class VacuumCoordinatorDataAttributes:
     timer: str = "timer"
     fan_speeds: str = "fan_speeds"
     fan_speeds_reverse: str = "fan_speeds_reverse"
+    mopping_intensities: str = "mopping_intensities"
+    mopping_intensities_reverse: str = "mopping_intensities_reverse"
 
 
 def _async_update_data_vacuum(hass, device: RoborockVacuum):
@@ -237,6 +241,8 @@ def _async_update_data_vacuum(hass, device: RoborockVacuum):
 
         fan_speeds = device.fan_speed_presets()
 
+        mopping_intensities = device.mop_intensity_presets()
+
         data = VacuumCoordinatorData(
             device.status(),
             device.dnd_status(),
@@ -246,6 +252,8 @@ def _async_update_data_vacuum(hass, device: RoborockVacuum):
             timer,
             fan_speeds,
             {v: k for k, v in fan_speeds.items()},
+            mopping_intensities,
+            {v: k for k, v in mopping_intensities.items()},
         )
 
         return data

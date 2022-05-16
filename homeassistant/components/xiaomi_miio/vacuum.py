@@ -198,6 +198,7 @@ class MiroboVacuum(
         | VacuumEntityFeature.BATTERY
         | VacuumEntityFeature.CLEAN_SPOT
         | VacuumEntityFeature.START
+        | VacuumEntityFeature.MOPPING_INTENSITY
     )
 
     def __init__(
@@ -248,6 +249,24 @@ class MiroboVacuum(
         """Get the list of available fan speed steps of the vacuum cleaner."""
         if speed_list := self.coordinator.data.fan_speeds:
             return list(speed_list)
+        return []
+
+    @property
+    def mopping_intensity(self) -> str:
+        """Return the mopping intensity of the vacuum cleaner."""
+        intensity = self.coordinator.data.status.mop_intensity
+        if intensity in self.coordinator.data.mopping_intensities_reverse:
+            return self.coordinator.data.mopping_intensities_reverse[intensity]
+
+        _LOGGER.debug("Unable to find reverse for %s", intensity)
+
+        return str(intensity)
+
+    @property
+    def mopping_intensity_list(self) -> list[str]:
+        """Get the list of available mopping intensity steps of the vacuum cleaner."""
+        if intensity_list := self.coordinator.data.mopping_intensities:
+            return list(intensity_list)
         return []
 
     @property
@@ -315,6 +334,24 @@ class MiroboVacuum(
                 return
         await self._try_command(
             "Unable to set fan speed: %s", self._device.set_fan_speed, fan_speed
+        )
+
+    async def async_set_mopping_intensity(self, mopping_intensity, **kwargs):
+        """Set mopping intensity."""
+        if mopping_intensity in self.coordinator.data.mopping_intensities:
+            mopping_intensity = self.coordinator.data.mopping_intensities[mopping_intensity]
+        else:
+            try:
+                mopping_intensity = int(mopping_intensity)
+            except ValueError as exc:
+                _LOGGER.error(
+                    "Mopping intensity step not recognized (%s). Valid intensities are: %s",
+                    exc,
+                    self.mopping_intensity_list,
+                )
+                return
+        await self._try_command(
+            "Unable to set mopping intensity: %s", self._device.set_waterflow, mopping_intensity
         )
 
     async def async_return_to_base(self, **kwargs):

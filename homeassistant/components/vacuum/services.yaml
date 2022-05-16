@@ -100,3 +100,20 @@ set_fan_speed:
       example: "low"
       selector:
         text:
+
+set_mopping_intensity:
+  name: Set mopping intensity
+  description: Set the mopping intensity of the vacuum cleaner.
+  target:
+    entity:
+      domain: vacuum
+  fields:
+    fan_speed:
+      name: Mopping intensity
+      description:
+        Platform dependent vacuum cleaner mopping intensity, with intensity steps, like
+        'medium' or by percentage, between 0 and 100.
+      required: true
+      example: "low"
+      selector:
+        text:

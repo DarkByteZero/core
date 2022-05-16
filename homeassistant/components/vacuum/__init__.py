@@ -51,6 +51,7 @@ SCAN_INTERVAL = timedelta(seconds=20)
 ATTR_BATTERY_ICON = "battery_icon"
 ATTR_CLEANED_AREA = "cleaned_area"
 ATTR_FAN_SPEED = "fan_speed"
+ATTR_MOPPING_INTENSITY = "mopping_intensity"
 ATTR_FAN_SPEED_LIST = "fan_speed_list"
 ATTR_PARAMS = "params"
 ATTR_STATUS = "status"
@@ -60,11 +61,11 @@ SERVICE_LOCATE = "locate"
 SERVICE_RETURN_TO_BASE = "return_to_base"
 SERVICE_SEND_COMMAND = "send_command"
 SERVICE_SET_FAN_SPEED = "set_fan_speed"
+SERVICE_SET_MOPPING_INTENSITY = "set_mopping_intensity"
 SERVICE_START_PAUSE = "start_pause"
 SERVICE_START = "start"
 SERVICE_PAUSE = "pause"
 SERVICE_STOP = "stop"
-
 
 STATE_CLEANING = "cleaning"
 STATE_DOCKED = "docked"
@@ -93,6 +94,7 @@ class VacuumEntityFeature(IntEnum):
     MAP = 2048
     STATE = 4096
     START = 8192
+    MOPPING_INTENSITY = 16384
 
 
 # These SUPPORT_* constants are deprecated as of Home Assistant 2022.5.
@@ -145,6 +147,11 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         SERVICE_SET_FAN_SPEED,
         {vol.Required(ATTR_FAN_SPEED): cv.string},
         "async_set_fan_speed",
+    )
+    component.async_register_entity_service(
+        SERVICE_SET_MOPPING_INTENSITY,
+        {vol.Required(ATTR_MOPPING_INTENSITY): cv.string},
+        "async_set_mopping_intensity",
     )
     component.async_register_entity_service(
         SERVICE_SEND_COMMAND,
@@ -203,9 +210,20 @@ class _BaseVacuum(Entity):
         return self._attr_fan_speed
 
     @property
+    def mopping_intensity(self) -> str | None:
+        """Return the mopping intensity of the vacuum cleaner."""
+        return self._attr_mopping_intensity
+
+
+    @property
     def fan_speed_list(self) -> list[str]:
         """Get the list of available fan speed steps of the vacuum cleaner."""
         return self._attr_fan_speed_list
+
+    @property
+    def mopping_intensity_list(self) -> list[str]:
+        """Get the list of available mopping intensity steps of the vacuum cleaner."""
+        return self._attr_mopping_intensity_list
 
     @property
     def capability_attributes(self) -> Mapping[str, Any] | None:
@@ -285,14 +303,27 @@ class _BaseVacuum(Entity):
             partial(self.set_fan_speed, fan_speed, **kwargs)
         )
 
+    def set_mopping_intensity(self, mopping_intensity: str, **kwargs: Any) -> None:
+        """Set mopping intensity."""
+        raise NotImplementedError()
+
+    async def async_set_mopping_intensity(self, mopping_intensity: str, **kwargs: Any) -> None:
+        """Set mopping intensity.
+
+        This method must be run in the event loop.
+        """
+        await self.hass.async_add_executor_job(
+            partial(self.set_mopping_intensity, mopping_intensity, **kwargs)
+        )
+
     def send_command(
-        self, command: str, params: dict | list | None = None, **kwargs: Any
+            self, command: str, params: dict | list | None = None, **kwargs: Any
     ) -> None:
         """Send a command to a vacuum cleaner."""
         raise NotImplementedError()
 
     async def async_send_command(
-        self, command: str, params: dict | list | None = None, **kwargs: Any
+            self, command: str, params: dict | list | None = None, **kwargs: Any
     ) -> None:
         """Send a command to a vacuum cleaner.
 

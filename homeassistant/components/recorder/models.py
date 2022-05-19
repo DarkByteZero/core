@@ -102,6 +102,12 @@ class FAST_PYSQLITE_DATETIME(sqlite.DATETIME):  # type: ignore[misc]
         return lambda value: None if value is None else ciso8601.parse_datetime(value)
 
 
+JSON_VARIENT_CAST = Text().with_variant(
+    postgresql.JSON(none_as_null=True), "postgresql"
+)
+JSONB_VARIENT_CAST = Text().with_variant(
+    postgresql.JSONB(none_as_null=True), "postgresql"
+)
 DATETIME_TYPE = (
     DateTime(timezone=True)
     .with_variant(mysql.DATETIME(timezone=True, fsp=6), "mysql")
@@ -117,6 +123,10 @@ EVENT_ORIGIN_ORDER = [EventOrigin.local, EventOrigin.remote]
 EVENT_ORIGIN_TO_IDX = {origin: idx for idx, origin in enumerate(EVENT_ORIGIN_ORDER)}
 
 
+class UnsupportedDialect(Exception):
+    """The dialect or its version is not supported."""
+
+
 class Events(Base):  # type: ignore[misc,valid-type]
     """Event history data."""
 
@@ -127,10 +137,10 @@ class Events(Base):  # type: ignore[misc,valid-type]
         {"mysql_default_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"},
     )
     __tablename__ = TABLE_EVENTS
-    event_id = Column(Integer, Identity(), primary_key=True)  # no longer used
+    event_id = Column(Integer, Identity(), primary_key=True)
     event_type = Column(String(MAX_LENGTH_EVENT_EVENT_TYPE))
     event_data = Column(Text().with_variant(mysql.LONGTEXT, "mysql"))
-    origin = Column(String(MAX_LENGTH_EVENT_ORIGIN))  # no longer used
+    origin = Column(String(MAX_LENGTH_EVENT_ORIGIN))  # no longer used for new rows
     origin_idx = Column(SmallInteger)
     time_fired = Column(DATETIME_TYPE, index=True)
     context_id = Column(String(MAX_LENGTH_EVENT_CONTEXT_ID), index=True)
@@ -244,8 +254,10 @@ class States(Base):  # type: ignore[misc,valid-type]
     state_id = Column(Integer, Identity(), primary_key=True)
     entity_id = Column(String(MAX_LENGTH_STATE_ENTITY_ID))
     state = Column(String(MAX_LENGTH_STATE_STATE))
-    attributes = Column(Text().with_variant(mysql.LONGTEXT, "mysql"))
-    event_id = Column(
+    attributes = Column(
+        Text().with_variant(mysql.LONGTEXT, "mysql")
+    )  # no longer used for new rows
+    event_id = Column(  # no longer used for new rows
         Integer, ForeignKey("events.event_id", ondelete="CASCADE"), index=True
     )
     last_changed = Column(DATETIME_TYPE)

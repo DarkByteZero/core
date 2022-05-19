@@ -40,7 +40,6 @@ from homeassistant.const import (
     ATTR_SERVICE,
     EVENT_CALL_SERVICE,
     EVENT_LOGBOOK_ENTRY,
-    EVENT_STATE_CHANGED,
 )
 from homeassistant.core import (
     Context,
@@ -51,12 +50,15 @@ from homeassistant.core import (
     split_entity_id,
 )
 from homeassistant.exceptions import InvalidEntityFormatError
-from homeassistant.helpers import config_validation as cv, entity_registry as er
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    entity_registry as er,
+)
 from homeassistant.helpers.entityfilter import (
     INCLUDE_EXCLUDE_BASE_FILTER_SCHEMA,
     EntityFilter,
     convert_include_exclude_filter,
-    generate_filter,
 )
 from homeassistant.helpers.integration_platform import (
     async_process_integration_platforms,
@@ -66,13 +68,12 @@ from homeassistant.loader import bind_hass
 import homeassistant.util.dt as dt_util
 
 from .queries import statement_for_request
+from .queries.common import PSUEDO_EVENT_STATE_CHANGED
 
 _LOGGER = logging.getLogger(__name__)
 
-FRIENDLY_NAME_JSON_EXTRACT = re.compile('"friendly_name": ?"([^"]+)"')
 ENTITY_ID_JSON_EXTRACT = re.compile('"entity_id": ?"([^"]+)"')
 DOMAIN_JSON_EXTRACT = re.compile('"domain": ?"([^"]+)"')
-ICON_JSON_EXTRACT = re.compile('"icon": ?"([^"]+)"')
 ATTR_MESSAGE = "message"
 
 DOMAIN = "logbook"
@@ -99,8 +100,11 @@ LOGBOOK_ENTRY_STATE = "state"
 LOGBOOK_ENTRY_WHEN = "when"
 
 ALL_EVENT_TYPES_EXCEPT_STATE_CHANGED = {EVENT_LOGBOOK_ENTRY, EVENT_CALL_SERVICE}
-
-SCRIPT_AUTOMATION_EVENTS = {EVENT_AUTOMATION_TRIGGERED, EVENT_SCRIPT_STARTED}
+ENTITY_EVENTS_WITHOUT_CONFIG_ENTRY = {
+    EVENT_LOGBOOK_ENTRY,
+    EVENT_AUTOMATION_TRIGGERED,
+    EVENT_SCRIPT_STARTED,
+}
 
 LOG_MESSAGE_SCHEMA = vol.Schema(
     {
@@ -212,12 +216,61 @@ async def _process_logbook_platform(
     platform.async_describe_events(hass, _async_describe_event)
 
 
+def _async_determine_event_types(
+    hass: HomeAssistant, entity_ids: list[str] | None, device_ids: list[str] | None
+) -> tuple[str, ...]:
+    """Reduce the event types based on the entity ids and device ids."""
+    external_events: dict[
+        str, tuple[str, Callable[[LazyEventPartialState], dict[str, Any]]]
+    ] = hass.data.get(DOMAIN, {})
+    if not entity_ids and not device_ids:
+        return (*ALL_EVENT_TYPES_EXCEPT_STATE_CHANGED, *external_events)
+    config_entry_ids: set[str] = set()
+    intrested_event_types: set[str] = set()
+
+    if entity_ids:
+        #
+        # Home Assistant doesn't allow firing events from
+        # entities so we have a limited list to check
+        #
+        # automations and scripts can refer to entities
+        # but they do not have a config entry so we need
+        # to add them.
+        #
+        # We also allow entity_ids to be recorded via
+        # manual logbook entries.
+        #
+        intrested_event_types |= ENTITY_EVENTS_WITHOUT_CONFIG_ENTRY
+
+    if device_ids:
+        dev_reg = dr.async_get(hass)
+        for device_id in device_ids:
+            if (device := dev_reg.async_get(device_id)) and device.config_entries:
+                config_entry_ids |= device.config_entries
+        interested_domains: set[str] = set()
+        for entry_id in config_entry_ids:
+            if entry := hass.config_entries.async_get_entry(entry_id):
+                interested_domains.add(entry.domain)
+        for external_event, domain_call in external_events.items():
+            if domain_call[0] in interested_domains:
+                intrested_event_types.add(external_event)
+
+    return tuple(
+        event_type
+        for event_type in (EVENT_LOGBOOK_ENTRY, *external_events)
+        if event_type in intrested_event_types
+    )
+
+
 def _ws_formatted_get_events(
     hass: HomeAssistant,
     msg_id: int,
     start_day: dt,
     end_day: dt,
+    event_types: tuple[str, ...],
+    ent_reg: er.EntityRegistry,
     entity_ids: list[str] | None = None,
+    device_ids: list[str] | None = None,
     filters: Filters | None = None,
     entities_filter: EntityFilter | Callable[[str], bool] | None = None,
     context_id: str | None = None,
@@ -230,11 +283,15 @@ def _ws_formatted_get_events(
                 hass,
                 start_day,
                 end_day,
+                event_types,
+                ent_reg,
                 entity_ids,
+                device_ids,
                 filters,
                 entities_filter,
                 context_id,
                 True,
+                False,
             ),
         )
     )
@@ -246,6 +303,7 @@ def _ws_formatted_get_events(
         vol.Required("start_time"): str,
         vol.Optional("end_time"): str,
         vol.Optional("entity_ids"): [str],
+        vol.Optional("device_ids"): [str],
         vol.Optional("context_id"): str,
     }
 )
@@ -273,11 +331,14 @@ async def ws_get_events(
         return
 
     if start_time > utc_now:
-        connection.send_result(msg["id"], {})
+        connection.send_result(msg["id"], [])
         return
 
+    device_ids = msg.get("device_ids")
     entity_ids = msg.get("entity_ids")
     context_id = msg.get("context_id")
+    event_types = _async_determine_event_types(hass, entity_ids, device_ids)
+    ent_reg = er.async_get(hass)
 
     connection.send_message(
         await get_instance(hass).async_add_executor_job(
@@ -286,7 +347,10 @@ async def ws_get_events(
             msg["id"],
             start_time,
             end_time,
+            event_types,
+            ent_reg,
             entity_ids,
+            device_ids,
             hass.data[LOGBOOK_FILTERS],
             hass.data[LOGBOOK_ENTITIES_FILTER],
             context_id,
@@ -356,6 +420,9 @@ class LogbookView(HomeAssistantView):
                 "Can't combine entity with context_id", HTTPStatus.BAD_REQUEST
             )
 
+        event_types = _async_determine_event_types(hass, entity_ids, None)
+        ent_reg = er.async_get(hass)
+
         def json_events() -> web.Response:
             """Fetch events and generate JSON."""
             return self.json(
@@ -363,11 +430,15 @@ class LogbookView(HomeAssistantView):
                     hass,
                     start_day,
                     end_day,
+                    event_types,
+                    ent_reg,
                     entity_ids,
+                    None,
                     self.filters,
                     self.entities_filter,
                     context_id,
                     False,
+                    True,
                 )
             )
 
@@ -385,6 +456,7 @@ def _humanify(
     ],
     entity_name_cache: EntityNameCache,
     format_time: Callable[[Row], Any],
+    include_entity_name: bool = True,
 ) -> Generator[dict[str, Any], None, None]:
     """Generate a converted list of events into entries."""
     # Continuous sensors, will be excluded from the logbook
@@ -393,7 +465,11 @@ def _humanify(
     context_lookup: dict[str | None, Row | None] = {None: None}
     event_cache = EventCache(event_data_cache)
     context_augmenter = ContextAugmenter(
-        context_lookup, entity_name_cache, external_events, event_cache
+        context_lookup,
+        entity_name_cache,
+        external_events,
+        event_cache,
+        include_entity_name,
     )
 
     def _keep_row(row: Row, event_type: str) -> bool:
@@ -419,13 +495,13 @@ def _humanify(
             continue
         event_type = row.event_type
         if event_type == EVENT_CALL_SERVICE or (
-            event_type != EVENT_STATE_CHANGED
+            event_type is not PSUEDO_EVENT_STATE_CHANGED
             and entities_filter is not None
             and not _keep_row(row, event_type)
         ):
             continue
 
-        if event_type == EVENT_STATE_CHANGED:
+        if event_type is PSUEDO_EVENT_STATE_CHANGED:
             entity_id = row.entity_id
             assert entity_id is not None
             # Skip continuous sensors
@@ -439,11 +515,12 @@ def _humanify(
 
             data = {
                 LOGBOOK_ENTRY_WHEN: format_time(row),
-                LOGBOOK_ENTRY_NAME: entity_name_cache.get(entity_id, row),
                 LOGBOOK_ENTRY_STATE: row.state,
                 LOGBOOK_ENTRY_ENTITY_ID: entity_id,
             }
-            if icon := _row_attributes_extract(row, ICON_JSON_EXTRACT):
+            if include_entity_name:
+                data[LOGBOOK_ENTRY_NAME] = entity_name_cache.get(entity_id, row)
+            if icon := row.icon or row.old_format_icon:
                 data[LOGBOOK_ENTRY_ICON] = icon
 
             context_augmenter.augment(data, row, context_id)
@@ -482,27 +559,27 @@ def _get_events(
     hass: HomeAssistant,
     start_day: dt,
     end_day: dt,
+    event_types: tuple[str, ...],
+    ent_reg: er.EntityRegistry,
     entity_ids: list[str] | None = None,
+    device_ids: list[str] | None = None,
     filters: Filters | None = None,
     entities_filter: EntityFilter | Callable[[str], bool] | None = None,
     context_id: str | None = None,
     timestamp: bool = False,
+    include_entity_name: bool = True,
 ) -> list[dict[str, Any]]:
     """Get events for a period of time."""
     assert not (
-        entity_ids and context_id
-    ), "can't pass in both entity_ids and context_id"
-
+        context_id and (entity_ids or device_ids)
+    ), "can't pass in both context_id and (entity_ids or device_ids)"
     external_events: dict[
         str, tuple[str, Callable[[LazyEventPartialState], dict[str, Any]]]
     ] = hass.data.get(DOMAIN, {})
-    event_types = (*ALL_EVENT_TYPES_EXCEPT_STATE_CHANGED, *external_events)
     format_time = _row_time_fired_timestamp if timestamp else _row_time_fired_isoformat
     entity_name_cache = EntityNameCache(hass)
-    ent_reg = er.async_get(hass)
-
-    if entity_ids is not None:
-        entities_filter = generate_filter([], entity_ids, [], [])
+    if entity_ids or device_ids:
+        entities_filter = None
 
     def yield_rows(query: Query) -> Generator[Row, None, None]:
         """Yield rows from the database."""
@@ -523,7 +600,13 @@ def _get_events(
         return query.yield_per(1024)  # type: ignore[no-any-return]
 
     stmt = statement_for_request(
-        start_day, end_day, event_types, entity_ids, filters, context_id
+        start_day,
+        end_day,
+        event_types,
+        entity_ids,
+        device_ids,
+        filters,
+        context_id,
     )
     if _LOGGER.isEnabledFor(logging.DEBUG):
         _LOGGER.debug(
@@ -540,6 +623,7 @@ def _get_events(
                 external_events,
                 entity_name_cache,
                 format_time,
+                include_entity_name,
             )
         )
 
@@ -555,12 +639,14 @@ class ContextAugmenter:
             str, tuple[str, Callable[[LazyEventPartialState], dict[str, Any]]]
         ],
         event_cache: EventCache,
+        include_entity_name: bool,
     ) -> None:
         """Init the augmenter."""
         self.context_lookup = context_lookup
         self.entity_name_cache = entity_name_cache
         self.external_events = external_events
         self.event_cache = event_cache
+        self.include_entity_name = include_entity_name
 
     def augment(self, data: dict[str, Any], row: Row, context_id: str) -> None:
         """Augment data from the row and cache."""
@@ -589,9 +675,10 @@ class ContextAugmenter:
         # State change
         if context_entity_id := context_row.entity_id:
             data[CONTEXT_ENTITY_ID] = context_entity_id
-            data[CONTEXT_ENTITY_ID_NAME] = self.entity_name_cache.get(
-                context_entity_id, context_row
-            )
+            if self.include_entity_name:
+                data[CONTEXT_ENTITY_ID_NAME] = self.entity_name_cache.get(
+                    context_entity_id, context_row
+                )
             data[CONTEXT_EVENT_TYPE] = event_type
             return
 
@@ -619,9 +706,10 @@ class ContextAugmenter:
         if not (attr_entity_id := described.get(ATTR_ENTITY_ID)):
             return
         data[CONTEXT_ENTITY_ID] = attr_entity_id
-        data[CONTEXT_ENTITY_ID_NAME] = self.entity_name_cache.get(
-            attr_entity_id, context_row
-        )
+        if self.include_entity_name:
+            data[CONTEXT_ENTITY_ID_NAME] = self.entity_name_cache.get(
+                attr_entity_id, context_row
+            )
 
 
 def _is_sensor_continuous(ent_reg: er.EntityRegistry, entity_id: str) -> bool:
@@ -654,12 +742,6 @@ def _rows_match(row: Row, other_row: Row) -> bool:
 def _row_event_data_extract(row: Row, extractor: re.Pattern) -> str | None:
     """Extract from event_data row."""
     result = extractor.search(row.shared_data or row.event_data or "")
-    return result.group(1) if result else None
-
-
-def _row_attributes_extract(row: Row, extractor: re.Pattern) -> str | None:
-    """Extract from attributes row."""
-    result = extractor.search(row.shared_attrs or row.attributes or "")
     return result.group(1) if result else None
 
 
@@ -735,8 +817,6 @@ class EntityNameCache:
             friendly_name := current_state.attributes.get(ATTR_FRIENDLY_NAME)
         ):
             self._names[entity_id] = friendly_name
-        elif extracted_name := _row_attributes_extract(row, FRIENDLY_NAME_JSON_EXTRACT):
-            self._names[entity_id] = extracted_name
         else:
             return split_entity_id(entity_id)[1].replace("_", " ")
 
